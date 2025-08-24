@@ -1,12 +1,12 @@
-name: Fetch OHLC and publish (OKX → main)
+name: Fetch OHLC and publish (OKX Perp → main)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # elke 5 minuten (pas aan wat je wilt)
+    - cron: "*/5 * * * *"   # elke 5 minuten automatisch runnen
+  workflow_dispatch:        # handmatig runnen blijft ook mogelijk
 
 permissions:
-  contents: write   # nodig om direct naar main te pushen
+  contents: write           # nodig om naar main te pushen
 
 jobs:
   run:
@@ -16,23 +16,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true   # gebruik GITHUB_TOKEN om te pushen
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fetch & build latest.json (OKX)
-        run: |
-          python fetch_and_publish.py --exchange okx --interval 1m --limit 200
+      - name: Fetch & build latest.json (OKX Perp)
+        env:
+          BAR: 1m
+          LIMIT: 200
+        run: python fetch_and_publish.py
 
-      - name: Commit & push to main
+      - name: Commit & push changes
         run: |
           git config user.name "gh-actions"
           git config user.email "actions@github.com"
@@ -40,6 +42,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "auto: refresh data/latest.json [skip ci]"
+            git commit -m "auto: refresh data/latest.json (perp) [skip ci]"
             git push origin HEAD:main
           fi
