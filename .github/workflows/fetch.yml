@@ -5,14 +5,20 @@ on:
   schedule:
     - cron: "*/2 * * * *"   # elke 2 minuten
 
+# Belangrijk: geef de workflow schrijfrechten en PR-rechten
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -22,14 +28,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fetch & build latest.json
+      - name: Fetch & build latest.json (OKX)
         run: |
           python fetch_and_publish.py
 
-      - name: Commit & push changes
-        run: |
-          git config user.name "gh-actions"
-          git config user.email "actions@github.com"
-          git add data/latest.json
-          git commit -m "update latest.json [skip ci]" || echo "No changes"
-          git push
+      # Laat de action zelf committen + PR openen
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          title: "Update data/latest.json"
+          body: |
+            Automated data refresh from OKX (1m klines for BTC/ETH/SOL perpetual).
+            - Exchange: OKX
+            - Interval: 1m
+            - Files: data/latest.json
+          commit-message: "data: refresh latest.json"
+          branch: bot/data-refresh
+          delete-branch: true
+          add-paths: |
+            data/latest.json
