@@ -1,4 +1,4 @@
-name: Fetch OHLC and publish
+name: Fetch OHLC and publish (OKX)
 
 on:
   workflow_dispatch:
@@ -8,11 +8,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-
-    env:
-      BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
-      BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
