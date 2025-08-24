@@ -1,4 +1,4 @@
-name: Fetch OHLC and publish (OKX Perp → main)
+name: Fetch OHLC and publish (OKX Perp → main, with mirrors)
 
 on:
   schedule:
@@ -23,25 +23,52 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      # Bouw de perp-feed 1m + 15m → data/latest.json
       - name: Build latest.json (perp 1m+15m)
         run: python fetch_and_publish.py
 
+      # Maak leesbare snapshot → SNAPSHOT.md
       - name: Build SNAPSHOT.md (readable page)
         run: python generate_snapshot.py
 
+      # Maak mirrors: index.md (homepage) + data/summary.json (kleine snelle JSON)
+      - name: Make snapshot homepage + build summary.json
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+          # 1) homepage kopie
+          Path("index.md").write_text(Path("SNAPSHOT.md").read_text(encoding="utf-8"), encoding="utf-8")
+          # 2) compacte summary.json met laatste close/volume van 1m en 15m
+          data = json.loads(Path("data/latest.json").read_text(encoding="utf-8"))
+          pairs = data.get("pairs", {})
+          def last(arr): return arr[-1] if arr else None
+          summary = {"updated_at": data.get("updated_at"), "pairs": {}}
+          for sym in ["BTCUSDT","ETHUSDT","SOLUSDT"]:
+            summary["pairs"][sym] = {}
+            for tf in ["1m","15m"]:
+              lc = last(pairs.get(sym, {}).get(tf, []))
+              if lc:
+                summary["pairs"][sym][tf] = {
+                  "time": lc.get("time"),
+                  "ts": lc.get("ts"),
+                  "close": lc.get("close"),
+                  "volume": lc.get("volume")
+                }
+          Path("data/summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+      # Commit & push alles direct naar main
       - name: Commit & push
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add data/latest.json SNAPSHOT.md || true
-
+          git add data/latest.json data/summary.json SNAPSHOT.md index.md || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "auto: refresh data/latest.json + SNAPSHOT.md (perp 1m+15m)"
+            git commit -m "auto: refresh latest.json + summary.json + snapshot (perp 1m+15m)"
             git pull --rebase origin main || true
             git push origin HEAD:main
           fi
