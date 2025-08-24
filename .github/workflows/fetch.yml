@@ -1,16 +1,18 @@
 name: Fetch OHLC and publish
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"   # elke 10 minuten (pas aan naar wens)
-
-permissions:
-  contents: write
+    - cron: "*/2 * * * *"   # elke 2 minuten
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    env:
+      BYBIT_API_KEY: ${{ secrets.BYBIT_API_KEY }}
+      BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -31,12 +33,8 @@ jobs:
 
       - name: Commit & push changes
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "gh-actions"
+          git config user.email "actions@github.com"
           git add data/latest.json
-          if git diff --cached --quiet; then
-            echo "No data changes to commit."
-          else
-            git commit -m "data: update latest.json ($(date -u +%F' '%T) UTC)"
-            git push
-          fi
+          git commit -m "update latest.json [skip ci]" || echo "No changes"
+          git push
