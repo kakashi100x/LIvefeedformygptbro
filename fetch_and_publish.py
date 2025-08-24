@@ -1,82 +1,75 @@
-#!/usr/bin/env python3
-import json, time, pathlib, requests
-from datetime import datetime, timezone
+# fetch_and_publish.py
+import os, time, hmac, hashlib, json, pathlib, urllib.parse, requests
 
-# Bybit v5 market kline endpoint (USDT-perp "linear" markt)
-BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+BASE_URL = "https://api.bybit.com"
+ENDPOINT = "/v5/market/kline"  # v5 market candles
 
-# Welke symbols & timeframes we willen (je kunt dit lijstje zelf uitbreiden)
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-# Keys: jouw benamingen -> Bybit interval codes
-INTERVALS = {"1m": "1", "5m": "5", "15m": "15"}   # pas aan naar wens
+SYMBOLS = [
+    ("BTCUSDT", "linear"),
+    ("ETHUSDT", "linear"),
+    ("SOLUSDT", "linear"),
+]
+INTERVAL = "1"   # 1m
+LIMIT = 200
+RECV_WINDOW = "5000"
 
-LIMIT = 200   # aantal candles per request (max 200 bij Bybit)
+API_KEY = os.environ.get("BYBIT_API_KEY", "")
+API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 
-def fetch_klines(symbol: str, interval_code: str, limit: int = LIMIT, category: str = "linear"):
-    """
-    Haalt candles op bij Bybit. Returned lijst van dicts met standard velden.
-    Bybit v5 fields per kline: [start, open, high, low, close, volume, turnover]
-    start is ms epoch.
-    """
-    params = {
+def sign_v5(secret: str, ts: str, api_key: str, recv_window: str, query_string: str) -> str:
+    # v5 sign string: timestamp + api_key + recv_window + queryString
+    payload = ts + api_key + recv_window + query_string
+    return hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+def get_klines(symbol: str, category: str):
+    ts = str(int(time.time() * 1000))
+    q = {
         "category": category,
         "symbol": symbol,
-        "interval": interval_code,
-        "limit": str(limit),
+        "interval": INTERVAL,
+        "limit": str(LIMIT),
     }
-    r = requests.get(BYBIT_KLINE_URL, params=params, timeout=20)
+    query_string = urllib.parse.urlencode(q, doseq=True)
+
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": RECV_WINDOW,
+        "Content-Type": "application/json",
+    }
+
+    # Alleen signen wanneer we een key hebben
+    if API_KEY and API_SECRET:
+        signature = sign_v5(API_SECRET, ts, API_KEY, RECV_WINDOW, query_string)
+        headers["X-BAPI-SIGN"] = signature
+
+    url = f"{BASE_URL}{ENDPOINT}?{query_string}"
+    r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
     data = r.json()
     if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit API error for {symbol} {interval_code}: {data.get('retMsg')}")
-    rows = data["result"]["list"]  # newest first per docs (we sort for zekerheid)
-    # Normaliseer naar oplopend op tijd
-    rows = sorted(rows, key=lambda x: int(x[0]))
-    out = []
-    for row in rows:
-        ts_ms, o, h, l, c, vol, turnover = row
-        out.append({
-            "t": int(ts_ms),                      # ms epoch
-            "time_iso": datetime.utcfromtimestamp(int(ts_ms)/1000).replace(tzinfo=timezone.utc).isoformat(),
-            "o": float(o),
-            "h": float(h),
-            "l": float(l),
-            "c": float(c),
-            "volume": float(vol),                 # contract volume
-            "turnover": float(turnover),          # quote volume (USDT)
-        })
+        raise RuntimeError(f"Bybit error: {data.get('retMsg')}")
+    return data["result"]["list"]  # lijst van candles nieuwste→oudste
+
+def build_payload():
+    out = {"source": "bybit_v5", "interval": INTERVAL, "limit": LIMIT, "ts": int(time.time()), "markets": {}}
+    for sym, cat in SYMBOLS:
+        kl = get_klines(sym, cat)
+        # normaliseer naar: [open_time, open, high, low, close, volume]
+        # Bybit v5 list-element: [start, open, high, low, close, volume, turnover]
+        norm = []
+        for row in reversed(kl):  # oud→nieuw
+            start, op, hi, lo, cl, vol, _ = row
+            norm.append([int(start), float(op), float(hi), float(lo), float(cl), float(vol)])
+        out["markets"][sym] = norm
     return out
 
 def main():
-    root = pathlib.Path(__file__).resolve().parent
-    out_dir = root / "data"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    bundle = {
-        "provider": "bybit",
-        "category": "linear",            # USDT perpetuals
-        "generated_utc": datetime.now(timezone.utc).isoformat(),
-        "symbols": {},
-        "meta": {
-            "source_url": BYBIT_KLINE_URL,
-            "limit": LIMIT,
-            "interval_map": INTERVALS,
-        },
-    }
-
-    for sym in SYMBOLS:
-        bundle["symbols"][sym] = {}
-        for tf, code in INTERVALS.items():
-            kl = fetch_klines(sym, code, LIMIT)
-            bundle["symbols"][sym][tf] = kl
-            time.sleep(0.25)  # vriendelijk voor rate limits
-
-    # Schrijf naar /data/latest.json
-    out_file = out_dir / "latest.json"
-    tmp = out_file.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(bundle, ensure_ascii=False, separators=(",", ":"), indent=2))
-    tmp.replace(out_file)
-    print(f"Wrote {out_file} with {len(SYMBOLS)} symbols.")
+    payload = build_payload()
+    pathlib.Path("data").mkdir(parents=True, exist_ok=True)
+    with open("data/latest.json", "w") as f:
+        json.dump(payload, f)
+    print("Wrote data/latest.json")
 
 if __name__ == "__main__":
     main()
