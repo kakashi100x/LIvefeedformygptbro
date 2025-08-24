@@ -1,10 +1,12 @@
-# .github/workflows/fetch.yml
 name: Fetch OHLC and publish
 
 on:
+  workflow_dispatch: {}
   schedule:
-    - cron: "*/5 * * * *"   # elke 5 minuten
-  workflow_dispatch:        # handmatig starten kan ook
+    - cron: "*/10 * * * *"   # elke 10 minuten (pas aan naar wens)
+
+permissions:
+  contents: write
 
 jobs:
   run:
@@ -16,22 +18,25 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Fetch & build latest.json
-        run: python fetch_and_publish.py
+        run: |
+          python fetch_and_publish.py
 
       - name: Commit & push changes
         run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor }}@users.noreply.github.com"
-          git add latest.json ohlc_data/*.csv || true
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/latest.json
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
           else
-            git commit -m "update: ${{ github.run_id }}"
+            git commit -m "data: update latest.json ($(date -u +%F' '%T) UTC)"
             git push
           fi
