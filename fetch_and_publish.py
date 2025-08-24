@@ -1,88 +1,82 @@
-# fetch_and_publish.py
-import os, json, time, sys
+#!/usr/bin/env python3
+import json, time, pathlib, requests
 from datetime import datetime, timezone
-from typing import List, Dict, Any
-import requests
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"  # correcte v3 endpoint
-UA = "livefeed-bot/1.0 (+https://github.com/)"
+# Bybit v5 market kline endpoint (USDT-perp "linear" markt)
+BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 
-# Lees optioneel symbolen/intervals uit env; anders defaults
-SYMBOLS = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
-INTERVALS = os.getenv("INTERVALS", "1m,15m").split(",")
-LIMIT = int(os.getenv("LIMIT", "200"))  # aantal candles per serie
-OUT_DIR = os.getenv("OUT_DIR", "data")
-OUT_FILE = os.path.join(OUT_DIR, "latest.json")
-TIMEOUT = 15
+# Welke symbols & timeframes we willen (je kunt dit lijstje zelf uitbreiden)
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+# Keys: jouw benamingen -> Bybit interval codes
+INTERVALS = {"1m": "1", "5m": "5", "15m": "15"}   # pas aan naar wens
 
-session = requests.Session()
-session.headers.update({"User-Agent": UA})
+LIMIT = 200   # aantal candles per request (max 200 bij Bybit)
 
-def ts_ms_to_iso(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
-
-def fetch_klines(symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
-    """Haal klines op en geef een net lijstje dicts terug."""
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    # eenvoudige retry met backoff
-    backoff = 2
-    for attempt in range(5):
-        try:
-            r = session.get(BINANCE_URL, params=params, timeout=TIMEOUT)
-            if r.status_code == 451:
-                raise RuntimeError(
-                    f"451 from Binance (legal/region). Probeer later opnieuw of gebruik alternatief endpoint."
-                )
-            r.raise_for_status()
-            raw = r.json()
-            # Kline velden volgens Binance:
-            # [0 openTime, 1 open, 2 high, 3 low, 4 close, 5 volume, 6 closeTime, ...]
-            out = []
-            for k in raw:
-                out.append({
-                    "t_open": ts_ms_to_iso(k[0]),
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low":  float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5]),
-                    "t_close": ts_ms_to_iso(k[6]),
-                })
-            return out
-        except Exception as e:
-            if attempt == 4:
-                raise
-            time.sleep(backoff)
-            backoff *= 1.8
-    # zou hier nooit komen:
-    return []
+def fetch_klines(symbol: str, interval_code: str, limit: int = LIMIT, category: str = "linear"):
+    """
+    Haalt candles op bij Bybit. Returned lijst van dicts met standard velden.
+    Bybit v5 fields per kline: [start, open, high, low, close, volume, turnover]
+    start is ms epoch.
+    """
+    params = {
+        "category": category,
+        "symbol": symbol,
+        "interval": interval_code,
+        "limit": str(limit),
+    }
+    r = requests.get(BYBIT_KLINE_URL, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit API error for {symbol} {interval_code}: {data.get('retMsg')}")
+    rows = data["result"]["list"]  # newest first per docs (we sort for zekerheid)
+    # Normaliseer naar oplopend op tijd
+    rows = sorted(rows, key=lambda x: int(x[0]))
+    out = []
+    for row in rows:
+        ts_ms, o, h, l, c, vol, turnover = row
+        out.append({
+            "t": int(ts_ms),                      # ms epoch
+            "time_iso": datetime.utcfromtimestamp(int(ts_ms)/1000).replace(tzinfo=timezone.utc).isoformat(),
+            "o": float(o),
+            "h": float(h),
+            "l": float(l),
+            "c": float(c),
+            "volume": float(vol),                 # contract volume
+            "turnover": float(turnover),          # quote volume (USDT)
+        })
+    return out
 
 def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
+    root = pathlib.Path(__file__).resolve().parent
+    out_dir = root / "data"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    payload = {
-        "source": "binance_spot_v3",
-        "symbols": [s.upper() for s in SYMBOLS],
-        "intervals": INTERVALS,
-        "limit": LIMIT,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "series": {}  # series[(symbol, interval)] -> list
+    bundle = {
+        "provider": "bybit",
+        "category": "linear",            # USDT perpetuals
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "symbols": {},
+        "meta": {
+            "source_url": BYBIT_KLINE_URL,
+            "limit": LIMIT,
+            "interval_map": INTERVALS,
+        },
     }
 
     for sym in SYMBOLS:
-        for itv in INTERVALS:
-            key = f"{sym.upper()}_{itv}"
-            data = fetch_klines(sym, itv, LIMIT)
-            payload["series"][key] = data
+        bundle["symbols"][sym] = {}
+        for tf, code in INTERVALS.items():
+            kl = fetch_klines(sym, code, LIMIT)
+            bundle["symbols"][sym][tf] = kl
+            time.sleep(0.25)  # vriendelijk voor rate limits
 
-    with open(OUT_FILE, "w") as f:
-        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-
-    print(f"Wrote {OUT_FILE} with {len(payload['series'])} series.")
+    # Schrijf naar /data/latest.json
+    out_file = out_dir / "latest.json"
+    tmp = out_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(bundle, ensure_ascii=False, separators=(",", ":"), indent=2))
+    tmp.replace(out_file)
+    print(f"Wrote {out_file} with {len(SYMBOLS)} symbols.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
