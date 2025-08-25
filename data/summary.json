@@ -1,17 +1,35 @@
 {
-  "exchange": "MEXC",
-  "market_type": "USDT_PERP",
-  "updated_at": "2025-08-25T17:30:15Z",
+  "exchange": "mexc",
+  "market": "perp",
+  "updated_at": "2025-08-25T17:53:57Z",
+  "updated_at_cet_label": "2025-08-25 17:53 UTC",
   "perps": {
-    "BTC": {
-      "mexc": 112713.8
+    "BTCUSDT": {
+      "price": 112495.7,
+      "bid": 112495.7,
+      "ask": 112495.8,
+      "volume24h": 617087973.0,
+      "source": "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT",
+      "timestamp_ms": 1756144435515,
+      "error": null
     },
-    "ETH": {
-      "mexc": 4594.21
+    "ETHUSDT": {
+      "price": 4596.03,
+      "bid": 4596.03,
+      "ask": 4596.04,
+      "volume24h": 214765647.0,
+      "source": "https://contract.mexc.com/api/v1/contract/ticker?symbol=ETH_USDT",
+      "timestamp_ms": 1756144435514,
+      "error": null
     },
-    "SOL": {
-      "mexc": 197.1
+    "SOLUSDT": {
+      "price": 196.8,
+      "bid": 196.79,
+      "ask": 196.8,
+      "volume24h": 693419250.0,
+      "source": "https://contract.mexc.com/api/v1/contract/ticker?symbol=SOL_USDT",
+      "timestamp_ms": 1756144435514,
+      "error": null
     }
-  },
-  "notes": []
+  }
 }
