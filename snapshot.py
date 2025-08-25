@@ -1,255 +1,302 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, json, time, math, hashlib, datetime as dt
-from typing import Dict, Any, List
+"""
+snapshot.py  —  MEXC Perpetual snapshot
+- Fetch 1m & 15m klines for BTC/ETH/SOL (MEXC PERP).
+- Compute EMA(20/50/200) and RSI(14) on both TFs.
+- Infer 15m bias + short confidence note.
+- Save to data/summary.json and SNAPSHOT.md.
+
+Runs fine on GitHub Actions without extra deps.
+"""
+
+import os
+import json
+import math
+import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 
-# ----------------------------
+# ------------------------
 # Config
-# ----------------------------
-EXCHANGE = "MEXC"
-BASE = "https://contract.mexc.com"  # MEXC Futures (USDT-M) public API
-SYMBOLS = {
-    "BTCUSDT": "BTC_USDT",
-    "ETHUSDT": "ETH_USDT",
-    "SOLUSDT": "SOL_USDT",
+# ------------------------
+
+BASE = "https://contract.mexc.com"  # MEXC Perpetual API
+SYMBOLS = ["BTC_USDT", "ETH_USDT", "SOL_USDT"]
+KLINES_LIMIT = 300  # enough for EMA200 on 1m/15m
+OUT_JSON = os.path.join("data", "summary.json")
+OUT_MD = "SNAPSHOT.md"
+
+SUPPORTED_INTERVALS = {
+    "1m": "Min1",
+    "15m": "Min15",
 }
-# Kline granularities: "Min1", "Min15"
-KLINES = {"1m": "Min1", "15m": "Min15"}
-KLINES_LIMIT = 200  # we berekenen RSI/EMA; we bewaren later alleen laatste 20 in snapshot
-TIMEOUT = 7
-RETRIES = 2
 
-OUTDIR = "data"
-OUTFILE = os.path.join(OUTDIR, "summary.json")
+# ------------------------
+# HTTP helpers
+# ------------------------
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def http_get(url: str) -> Any:
+def http_get(url, timeout=12, retries=2, backoff=0.6):
     last_err = None
-    for _ in range(RETRIES + 1):
+    for i in range(retries + 1):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "snapshot/1.0"}), timeout=TIMEOUT) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "snapshot/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
-        except Exception as e:
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
             last_err = e
-            time.sleep(0.6)
+            if i < retries:
+                time.sleep(backoff * (2 ** i))
+            else:
+                raise
     raise last_err
 
-def ema(values: List[float], period: int) -> float:
-    if len(values) < period or period < 1: return float("nan")
-    k = 2 / (period + 1.0)
-    ema_val = values[0]
-    for v in values[1:]:
-        ema_val = v * k + ema_val * (1 - k)
-    return ema_val
+def get_kline(symbol: str, gran_key: str, limit: int = 200):
+    """
+    Fetch MEXC contract klines.
+    symbol: "BTC_USDT", "ETH_USDT", "SOL_USDT"
+    gran_key: "1m" or "15m" (mapped to MEXC interval strings)
+    """
+    if gran_key not in SUPPORTED_INTERVALS:
+        raise ValueError(f"Unsupported interval {gran_key}")
+    gran = SUPPORTED_INTERVALS[gran_key]
+    url = f"{BASE}/api/v1/contract/kline/{symbol}?interval={gran}&limit={limit}"
+    data = http_get(url)
+    # Expected: {"success":true,"code":0,"data":[{...}, ...]}
+    if not data or not data.get("success", False) or "data" not in data:
+        raise RuntimeError(f"Unexpected kline response for {symbol}: {data!r}")
+    return data["data"]
 
-def rsi(values: List[float], period: int = 14) -> float:
-    if len(values) <= period: return float("nan")
-    gains, losses = [], []
+def parse_ohlc_list(rows):
+    """
+    Converts raw MEXC kline rows to arrays of close prices and meta rows.
+    Each row contains keys: time, open, high, low, close, vol, amount
+    """
+    if not rows:
+        return [], []
+    # sort by time just in case
+    rows = sorted(rows, key=lambda r: int(r["time"]))
+    closes = [float(r["close"]) for r in rows]
+    return closes, rows
+
+def parse_latest_ohlc(rows):
+    if not rows:
+        raise ValueError("Empty kline list")
+    last = rows[-1]
+    return {
+        "ts": int(last["time"]),                 # ms epoch
+        "open": float(last["open"]),
+        "high": float(last["high"]),
+        "low": float(last["low"]),
+        "close": float(last["close"]),
+        "volume": float(last.get("vol", 0)),     # contract volume
+        "turnover": float(last.get("amount", 0)) # quote turnover
+    }
+
+# ------------------------
+# Indicators (no deps)
+# ------------------------
+
+def ema(values, period):
+    if len(values) < period:
+        return [math.nan] * len(values)
+    k = 2.0 / (period + 1)
+    out = []
+    ema_prev = sum(values[:period]) / period
+    # seed
+    for i in range(period):
+        out.append(math.nan)
+    out.append(ema_prev)
+    for v in values[period+1:]:
+        ema_prev = v * k + ema_prev * (1 - k)
+        out.append(ema_prev)
+    return out
+
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return [math.nan] * len(values)
+    gains = [0.0]
+    losses = [0.0]
     for i in range(1, len(values)):
         ch = values[i] - values[i-1]
         gains.append(max(ch, 0.0))
         losses.append(max(-ch, 0.0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(values)-1):
-        avg_gain = (avg_gain*(period-1) + gains[i]) / period
-        avg_loss = (avg_loss*(period-1) + losses[i]) / period
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100/(1+rs))
-
-def pct(a: float, b: float) -> float:
-    try:
-        return (a/b - 1.0) * 100.0
-    except Exception:
-        return float("nan")
-
-def now_utc_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-# ----------------------------
-# MEXC endpoints (public)
-# ----------------------------
-def get_ticker(symbol_mexc: str) -> Dict[str, Any]:
-    # https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT
-    data = http_get(f"{BASE}/api/v1/contract/ticker?symbol={symbol_mexc}")
-    # Response sample (fields used may vary slightly; adjust if needed)
-    t = data.get("data", {})
-    return {
-        "last": float(t.get("lastPrice")) if t.get("lastPrice") is not None else None,
-        "bid": float(t.get("bid1")) if t.get("bid1") is not None else None,
-        "ask": float(t.get("ask1")) if t.get("ask1") is not None else None,
-        "high24h": float(t.get("high24Price")) if t.get("high24Price") is not None else None,
-        "low24h": float(t.get("low24Price")) if t.get("low24Price") is not None else None,
-        "volume24h": float(t.get("volume24")) if t.get("volume24") is not None else None,
-        "change24h_pct": float(t.get("riseFallRate")) if t.get("riseFallRate") is not None else None,  # %
-        "indexPrice": float(t.get("indexPrice")) if t.get("indexPrice") is not None else None,
-        "fairPrice": float(t.get("fairPrice")) if t.get("fairPrice") is not None else None,  # mark
-    }
-
-def get_funding(symbol_mexc: str) -> Dict[str, Any]:
-    # https://contract.mexc.com/api/v1/contract/funding-rate?symbol=BTC_USDT
-    try:
-        data = http_get(f"{BASE}/api/v1/contract/funding-rate?symbol={symbol_mexc}")
-        f = data.get("data", {})
-        return {
-            "fundingRate": float(f.get("fundingRate")) if f.get("fundingRate") is not None else None,
-            "nextFundingTime": f.get("nextSettleTime"),  # ms timestamp string
-        }
-    except Exception:
-        return {"fundingRate": None, "nextFundingTime": None}
-
-def get_depth(symbol_mexc: str, limit: int = 5) -> Dict[str, Any]:
-    # https://contract.mexc.com/api/v1/contract/depth?symbol=BTC_USDT&limit=5
-    try:
-        d = http_get(f"{BASE}/api/v1/contract/depth?symbol={symbol_mexc}&limit={limit}")
-        data = d.get("data", {})
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-        best_bid = float(bids[0][0]) if bids else None
-        best_ask = float(asks[0][0]) if asks else None
-        spread = (best_ask - best_bid) if (best_bid and best_ask) else None
-        spread_bps = (spread / ((best_ask + best_bid)/2) * 10000) if spread and best_bid and best_ask else None
-        return {
-            "bestBid": best_bid, "bestAsk": best_ask,
-            "spread": spread, "spread_bps": spread_bps,
-            "bids": bids[:limit], "asks": asks[:limit],
-        }
-    except Exception:
-        return {"bestBid": None, "bestAsk": None, "spread": None, "spread_bps": None, "bids": [], "asks": []}
-
-def get_kline(symbol_mexc: str, gran: str, limit: int) -> List[Dict[str, Any]]:
-    # https://contract.mexc.com/api/v1/contract/kline?symbol=BTC_USDT&interval=Min1&limit=200
-    raw = http_get(f"{BASE}/api/v1/contract/kline?symbol={symbol_mexc}&interval={gran}&limit={limit}")
-    arr = raw.get("data") or []
-    # Expected item order: [t, open, high, low, close, volume, ...]  (adjust if API differs)
-    kl = []
-    for it in arr:
-        # be tolerant for dict/array formats
-        if isinstance(it, list) and len(it) >= 6:
-            ts, o, h, l, c, v = it[0], it[1], it[2], it[3], it[4], it[5]
-            kl.append({
-                "t": int(ts), "o": float(o), "h": float(h), "l": float(l), "c": float(c), "v": float(v)
-            })
-        elif isinstance(it, dict):
-            kl.append({
-                "t": int(it.get("time", 0)),
-                "o": float(it.get("open", "nan")),
-                "h": float(it.get("high", "nan")),
-                "l": float(it.get("low", "nan")),
-                "c": float(it.get("close", "nan")),
-                "v": float(it.get("volume", "nan")),
-            })
-    # oldest -> newest per MEXC; ensure sort
-    kl.sort(key=lambda x: x["t"])
-    return kl
-
-def indicators_from_klines(kl: List[Dict[str, Any]]) -> Dict[str, Any]:
-    closes = [k["c"] for k in kl]
-    last_close = closes[-1] if closes else None
-    ema20 = ema(closes[-100:], 20) if closes else float("nan")
-    ema50 = ema(closes[-150:], 50) if closes else float("nan")
-    rsi14 = rsi(closes[-120:], 14) if closes else float("nan")
-    return {
-        "lastClose": last_close,
-        "ema20": None if math.isnan(ema20) else round(ema20, 6),
-        "ema50": None if math.isnan(ema50) else round(ema50, 6),
-        "rsi14": None if math.isnan(rsi14) else round(rsi14, 3),
-        "trend": ("bullish" if last_close and ema20 and last_close > ema20 else
-                  "bearish" if last_close and ema20 and last_close < ema20 else "neutral")
-    }
-
-# ----------------------------
-# Main
-# ----------------------------
-def build_snapshot() -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "exchange": EXCHANGE,
-        "type": "perpetuals",
-        "updated_at": now_utc_iso(),
-        "symbols": {}
-    }
-    for std, mexc in SYMBOLS.items():
-        ticker = get_ticker(mexc)
-        funding = get_funding(mexc)
-        depth = get_depth(mexc, limit=5)
-
-        per_symbol = {
-            "symbol": std,
-            "mexc_symbol": mexc,
-            "last": ticker["last"],
-            "bid": depth["bestBid"] or ticker["bid"],
-            "ask": depth["bestAsk"] or ticker["ask"],
-            "spread": depth["spread"],
-            "spread_bps": depth["spread_bps"],
-            "index": ticker["indexPrice"],
-            "mark": ticker["fairPrice"],
-            "high24h": ticker["high24h"],
-            "low24h": ticker["low24h"],
-            "volume24h": ticker["volume24h"],
-            "change24h_pct": ticker["change24h_pct"],  # %
-            "fundingRate": funding["fundingRate"],
-            "nextFundingTime": funding["nextFundingTime"],
-            "klines": {},
-        }
-
-        # Kliness + lite-indicators
-        for label, gran in KLINES.items():
-            kl = get_kline(mexc, gran, KLINES_LIMIT)
-            inds = indicators_from_klines(kl)
-            # bewaar laatste 20 candles voor snapshot (memory friendly)
-            per_symbol["klines"][label] = {
-                "last20": kl[-20:],
-                "indicators": inds,
-            }
-
-        # basis vs index/mark (basis = mark/index - 1 in bps):
-        if per_symbol["index"] and per_symbol["mark"]:
-            basis_bps = (per_symbol["mark"]/per_symbol["index"] - 1.0) * 10000
+    # seed average
+    avg_gain = sum(gains[1:period+1]) / period
+    avg_loss = sum(losses[1:period+1]) / period
+    rsis = [math.nan] * (period)
+    # first RSI
+    rs = avg_gain / avg_loss if avg_loss > 0 else float('inf')
+    rsis.append(100 - (100 / (1 + rs)))
+    # Wilder smoothing
+    for i in range(period+1, len(values)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsis.append(100.0)
         else:
-            basis_bps = None
-        per_symbol["basis_bps"] = basis_bps
+            rs = avg_gain / avg_loss
+            rsis.append(100 - (100 / (1 + rs)))
+    return rsis
 
-        out["symbols"][std] = per_symbol
+# ------------------------
+# Bias + confidence
+# ------------------------
 
-    # compacte “digest” voor pricechek
-    out["digest"] = {
-        k: {
-            "last": v["last"],
-            "bid": v["bid"],
-            "ask": v["ask"],
-            "spread_bps": v["spread_bps"],
-            "change24h_pct": v["change24h_pct"],
-            "fundingRate": v["fundingRate"],
-            "basis_bps": v["basis_bps"],
-            "1m": v["klines"]["1m"]["indicators"],
-            "15m": v["klines"]["15m"]["indicators"],
-        } for k, v in out["symbols"].items()
+def infer_bias_15m(close, ema20, ema50, ema200, rsi14):
+    """
+    Simple, robust bias heuristic:
+    - bullish: close > EMA50 and EMA20 > EMA50; bonus if EMA50 > EMA200 and RSI>55
+    - bearish: close < EMA50 and EMA20 < EMA50; bonus if EMA50 < EMA200 and RSI<45
+    - else: neutral
+    Returns (bias, confidence:str)
+    """
+    c = close[-1]
+    e20 = ema20[-1]
+    e50 = ema50[-1]
+    e200 = ema200[-1]
+    r = rsi14[-1]
+
+    score = 0
+    if c > e50 and e20 > e50:
+        score += 2
+        if e50 > e200: score += 1
+        if r > 55: score += 1
+        bias = "bullish"
+    elif c < e50 and e20 < e50:
+        score += 2
+        if e50 < e200: score += 1
+        if r < 45: score += 1
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    if bias == "neutral":
+        conf = "weak / mixed structure"
+    else:
+        conf = "strong" if score >= 3 else "moderate"
+    return bias, conf
+
+# ------------------------
+# Build snapshot per symbol
+# ------------------------
+
+def build_symbol_block(symbol: str):
+    # 1m
+    rows_1m = get_kline(symbol, "1m", KLINES_LIMIT)
+    closes_1m, rows_1m_sorted = parse_ohlc_list(rows_1m)
+    ema20_1m = ema(closes_1m, 20)
+    ema50_1m = ema(closes_1m, 50)
+    ema200_1m = ema(closes_1m, 200)
+    rsi14_1m = rsi(closes_1m, 14)
+    last_1m = parse_latest_ohlc(rows_1m_sorted)
+
+    # 15m
+    rows_15m = get_kline(symbol, "15m", KLINES_LIMIT)
+    closes_15m, rows_15m_sorted = parse_ohlc_list(rows_15m)
+    ema20_15m = ema(closes_15m, 20)
+    ema50_15m = ema(closes_15m, 50)
+    ema200_15m = ema(closes_15m, 200)
+    rsi14_15m = rsi(closes_15m, 14)
+    last_15m = parse_latest_ohlc(rows_15m_sorted)
+
+    bias15, conf15 = infer_bias_15m(closes_15m, ema20_15m, ema50_15m, ema200_15m, rsi14_15m)
+
+    return {
+        "symbol": symbol,
+        "perp": True,
+        "timeframes": {
+            "1m": {
+                "latest": last_1m,
+                "ema": {
+                    "ema20": ema20_1m[-1],
+                    "ema50": ema50_1m[-1],
+                    "ema200": ema200_1m[-1],
+                },
+                "rsi14": rsi14_1m[-1]
+            },
+            "15m": {
+                "latest": last_15m,
+                "ema": {
+                    "ema20": ema20_15m[-1],
+                    "ema50": ema50_15m[-1],
+                    "ema200": ema200_15m[-1],
+                },
+                "rsi14": rsi14_15m[-1],
+                "bias": {
+                    "state": bias15,
+                    "confidence": conf15
+                }
+            }
+        }
     }
-    return out
 
-def file_hash(path: str) -> str:
-    if not os.path.exists(path): return ""
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
+# ------------------------
+# Snapshot builder
+# ------------------------
+
+def now_utc_iso():
+    # ISO8601 in UTC with 'Z'
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+def build_snapshot():
+    assets = []
+    for sym in SYMBOLS:
+        assets.append(build_symbol_block(sym))
+    snap = {
+        "updated_at": now_utc_iso(),
+        "exchange": "mexc",
+        "kind": "perpetual",
+        "source": f"{BASE}/api/v1/contract/kline/{{symbol}}?interval={{interval}}",
+        "intervals": ["1m", "15m"],
+        "assets": assets,
+    }
+    return snap
+
+# ------------------------
+# Writers
+# ------------------------
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def write_md(path, snapshot):
+    def fmt_ts(ms):
+        return datetime.fromtimestamp(ms/1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    rows = []
+    rows.append(f"### Live Perp Snapshot (MEXC)\n")
+    rows.append(f"_Auto-updated_: {snapshot['updated_at']}\n")
+    rows.append("| Pair | TF | Price | TS (UTC) | 15m Bias | RSI(15m) | Vol(1m) |")
+    rows.append("|---|---:|---:|---|---|---:|---:|")
+    for a in snapshot["assets"]:
+        sym = a["symbol"]
+        l1 = a["timeframes"]["1m"]["latest"]
+        l15 = a["timeframes"]["15m"]["latest"]
+        bias = a["timeframes"]["15m"]["bias"]["state"]
+        rsi15 = a["timeframes"]["15m"]["rsi14"]
+        rows.append(f"| {sym} | 1m | {l1['close']:.2f} | {fmt_ts(l1['ts'])} |  |  | {l1.get('volume', 0):.0f} |")
+        rows.append(f"| {sym} | 15m | {l15['close']:.2f} | {fmt_ts(l15['ts'])} | {bias} | {rsi15:.1f} |  |")
+    rows.append("\n_Bron: MEXC perpetual futures klines. Intervals: 1m & 15m. Tijden in UTC._\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(rows))
+
+# ------------------------
+# Main
+# ------------------------
 
 def main():
-    os.makedirs(OUTDIR, exist_ok=True)
-    before = file_hash(OUTFILE)
     snap = build_snapshot()
-    with open(OUTFILE, "w", encoding="utf-8") as f:
-        json.dump(snap, f, ensure_ascii=False, indent=2)
-    after = file_hash(OUTFILE)
-    changed = (before != after)
-    # print een korte logregel (handig voor Actions)
-    print(f"snapshot_written changed={changed} updated_at={snap['updated_at']}")
-    # exit 0 altijd; commit/doen we in workflow
-    return 0
+    write_json(OUT_JSON, snap)
+    write_md(OUT_MD, snap)
+    print(f"Wrote {OUT_JSON} and {OUT_MD}")
+    # Minimal console echo (handig in Actions logs)
+    for a in snap["assets"]:
+        p = a["timeframes"]["1m"]["latest"]["close"]
+        print(f"{a['symbol']} 1m close: {p}")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
