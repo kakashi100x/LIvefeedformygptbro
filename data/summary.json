@@ -1,11 +1,17 @@
 {
   "exchange": "MEXC",
   "market_type": "USDT_PERP",
-  "updated_at": "1970-01-01T00:00:00Z",
+  "updated_at": "2025-08-25T17:30:15Z",
   "perps": {
-    "BTC": { "mexc": null },
-    "ETH": { "mexc": null },
-    "SOL": { "mexc": null }
+    "BTC": {
+      "mexc": 112713.8
+    },
+    "ETH": {
+      "mexc": 4594.21
+    },
+    "SOL": {
+      "mexc": 197.1
+    }
   },
   "notes": []
 }

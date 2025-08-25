@@ -1,0 +1,7 @@
+# Snapshot — MEXC USDT-Perps
+
+**Updated (UTC):** 2025-08-25T17:30:15Z
+
+- BTC: 112.713,8000
+- ETH: 4.594,2100
+- SOL: 197,1000
