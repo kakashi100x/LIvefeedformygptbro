@@ -2,40 +2,76 @@ name: Snapshot (MEXC Perps)
 
 on:
   schedule:
+    # elke 10 minuten
     - cron: "*/10 * * * *"
   workflow_dispatch:
+  push:
+    paths:
+      - "snapshot.py"
+      - "requirements.txt"
+      - ".github/workflows/snapshot.yml"
 
+# GitHub-token moet mogen pushen
 permissions:
   contents: write
+
+# voorkom overlap als een run langer duurt dan 10 min
+concurrency:
+  group: snapshot
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run snapshot
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          python snapshot.py
+          set -e
+          # tot 3 pogingen met korte pauze (handig bij tijdelijke API-hiccups)
+          for i in 1 2 3; do
+            echo "Run attempt $i"
+            if python snapshot.py; then
+              echo "Snapshot succeeded on attempt $i"
+              break
+            fi
+            echo "Snapshot failed on attempt $i — retrying in 5s..."
+            sleep 5
+          done
 
       - name: Commit if changed
         run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add data/summary.json
-            git commit -m "snapshot: update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # zorg dat de map bestaat zodat 'git add' nooit faalt
+          mkdir -p data
+
+          # BELANGRIJK: voeg zowel JSON als MD toe
+          git add data/ SNAPSHOT.md
+
+          # commit alleen als er staged changes zijn
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
           else
-            echo "No changes."
+            git commit -m "snapshot: update $(date -u +'%Y-%m-%dT%H:%M:%SZ') [skip ci]"
+            git push
           fi
