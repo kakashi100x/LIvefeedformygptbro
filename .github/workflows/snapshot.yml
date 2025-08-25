@@ -1,19 +1,20 @@
-name: Snapshot (MEXC Perps)
+name: snapshot
 
 on:
+  # elke 10 minuten draaien
   schedule:
-    # elke 10 minuten
     - cron: "*/10 * * * *"
+  # handmatig starten vanuit de Actions-tab
   workflow_dispatch:
+  # automatisch opnieuw draaien als je deze files wijzigt
   push:
     paths:
       - "snapshot.py"
       - "requirements.txt"
       - ".github/workflows/snapshot.yml"
 
-# GitHub-token moet mogen pushen
 permissions:
-  contents: write
+  contents: write   # nodig om te committen/pushen
 
 # voorkom overlap als een run langer duurt dan 10 min
 concurrency:
@@ -23,12 +24,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 1
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -42,36 +42,27 @@ jobs:
 
       - name: Run snapshot
         env:
-          PYTHONUNBUFFERED: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          # tot 3 pogingen met korte pauze (handig bij tijdelijke API-hiccups)
-          for i in 1 2 3; do
-            echo "Run attempt $i"
-            if python snapshot.py; then
-              echo "Snapshot succeeded on attempt $i"
-              break
-            fi
-            echo "Snapshot failed on attempt $i — retrying in 5s..."
-            sleep 5
-          done
-
-      - name: Commit if changed
-        run: |
-          set -e
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # zorg dat de map bestaat zodat 'git add' nooit faalt
+          # zorg dat map bestaat
           mkdir -p data
+          # run jouw script (verwacht output naar data/summary.json en SNAPSHOT.md)
+          python snapshot.py
+          # sanity checks: faal als output er niet is
+          test -f data/summary.json
+          test -f SNAPSHOT.md
 
-          # BELANGRIJK: voeg zowel JSON als MD toe
-          git add data/ SNAPSHOT.md
-
-          # commit alleen als er staged changes zijn
-          if git diff --staged --quiet; then
+      - name: Commit snapshot if changed
+        run: |
+          set -e
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/summary.json SNAPSHOT.md || true
+          if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "snapshot: update $(date -u +'%Y-%m-%dT%H:%M:%SZ') [skip ci]"
+            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            git commit -m "snapshot: update ${now}"
             git push
           fi
