@@ -2,319 +2,290 @@
 # -*- coding: utf-8 -*-
 
 """
-Builds a fresh snapshot for BTC/ETH/SOL perpetuals from MEXC Contract (perp) API.
+MEXC Perp snapshot -> data/summary.json + SNAPSHOT.md
 
-Outputs:
-  - data/summary.json
-  - SNAPSHOT.md
+Coins: BTC_USDT, ETH_USDT, SOL_USDT
+TFs:  1m (laatste close/prev) + 15m (laatste bar + %change)
 
-Robustness:
-  - Tries multiple MEXC kline endpoints (query & path style)
-  - Accepts klines returned as list OR wrapped in dicts under "data"
-  - Accepts row shapes: dict with o/h/l/c/time/volume (or o/c/h/l/t/v) OR list-indexed rows
-  - Graceful fallbacks and clear errors for GitHub Actions logs
+Robuust tegen MEXC responses waar 'data' soms als string i.p.v. lijst terugkomt.
 """
 
-import json
 import os
-import sys
+import json
+import ast
 import time
 import math
-import traceback
-from typing import Any, Dict, List, Tuple
-from datetime import datetime, timezone
-
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
 
-# -------------------------
+# ---------------------------------------------------------
 # Config
-# -------------------------
-SYMBOLS = {
-    "BTCUSDT": "BTC_USDT",
-    "ETHUSDT": "ETH_USDT",
-    "SOLUSDT": "SOL_USDT",
-}
-
-# hoeveel 1m candles meenemen in snapshot (laatste N)
-KLINES_LIMIT = 60  # 1 uur aan 1m, prima voor 15m bias etc.
-
-TIMEOUT = 15  # seconds
-UA = "snapshot/1.1 (+github-actions)"
-
-# MEXC Contract (perp) klines – we proberen 2 varianten
-KLINE_ENDPOINTS = [
-    # query-variant
-    "https://contract.mexc.com/api/v1/contract/kline?symbol={sym}&interval=Min1&limit={limit}",
-    # path-variant (sommige mirrors/documentatie gebruiken dit pad)
-    "https://contract.mexc.com/api/v1/contract/kline/{sym}?interval=Min1&limit={limit}",
+# ---------------------------------------------------------
+SYMBOLS = [
+    ("BTC_USDT", "BTCUSDT"),
+    ("ETH_USDT", "ETHUSDT"),
+    ("SOL_USDT", "SOLUSDT"),
 ]
 
-# optioneel: ticker voor extra sanity info (niet hard afhankelijk)
-TICKER_ENDPOINT = "https://contract.mexc.com/api/v1/contract/ticker?symbol={sym}"
+KLINES_LIMIT_1M = 60       # laatste 60 minuten
+KLINES_LIMIT_15M = 200     # ~2 dagen
+TIMEOUT = 15
+UA = "snapshot/1.0 (+https://github.com/kakashi100x/LIvefeedformygptbro)"
 
+OUT_DIR = "data"
+SUMMARY_JSON = os.path.join(OUT_DIR, "summary.json")
+SNAPSHOT_MD = "SNAPSHOT.md"
 
-# -------------------------
-# HTTP helper
-# -------------------------
-def http_get(url: str) -> Any:
+# ---------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------
+def http_get(url: str, timeout: int = TIMEOUT) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        data = resp.read()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
     try:
-        return json.loads(data.decode("utf-8"))
-    except Exception:
-        # laat raw string zien in foutlog indien geen JSON
-        raise ValueError(f"Non-JSON response from {url}: {data[:200]!r}")
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError:
+        # Soms komt er geen zuivere JSON terug; keer dan bytes/str terug
+        return raw.decode("utf-8", errors="replace")
 
+# ---------------------------------------------------------
+# Normalisatie helpers
+# ---------------------------------------------------------
+def parse_data_maybe_string(obj: Any) -> Any:
+    """
+    Sommige MEXC responses hebben 'data' als string met een array-inhoud.
+    Probeer JSON -> anders ast.literal_eval -> anders raise.
+    """
+    if isinstance(obj, str):
+        # probeer JSON
+        try:
+            return json.loads(obj)
+        except json.JSONDecodeError:
+            pass
+        # probeer Python literal (safe)
+        try:
+            return ast.literal_eval(obj)
+        except Exception:
+            # als het er uitziet als iets heel lang: kort maken in error
+            preview = obj[:200] + ("..." if len(obj) > 200 else "")
+            raise ValueError(f"Kline 'data' was string but not parseable: {preview}")
+    return obj
 
-# -------------------------
-# Kline normalisatie
-# -------------------------
-def normalize_klines(obj: Any) -> List[Any]:
+def normalize_klines(payload: Any) -> List[list]:
     """
-    Accepteert:
-      1) {"data":[...]}
-      2) {"data":{...}}       <-- enkele candle in dict → wrap in list (FIX)
-      3) {"success":true,"code":0,"data":[...]}
-      4) [... ] (raw list)
-    Retourneert altijd een list met rows.
+    Zorg dat we altijd een lijst van rijen teruggeven.
+    Toegestane vormen:
+    - dict met 'data' (kan list of string zijn)
+    - lijst (rechtstreeks klines)
+    - string (probeer alsnog te parsen)
+    Elke rij moet minimaal [ts, open, high, low, close, volume] bevatten.
     """
+    obj = payload
+
+    # Als de hele payload een string is, probeer te parsen
+    obj = parse_data_maybe_string(obj)
+
     rows = None
     if isinstance(obj, dict):
-        # Meest voorkomend bij MEXC: data onder "data"
-        if "data" in obj:
-            rows = obj["data"]
-        # Sommige gateways zetten success/code erbij
-        elif "success" in obj and "code" in obj:
-            rows = obj.get("data", [])
-        else:
-            # Soms geven ze een foutobject terug — laat het zien
-            raise ValueError(f"Unexpected kline payload: {obj}")
-
-        # *** Belangrijke FIX: enkele dict → lijst maken
-        if isinstance(rows, dict):
-            rows = [rows]
-
+        # MEXC structuur: {'success': True, 'code': 0, 'data': [...]}
+        rows = obj.get("data")
+        rows = parse_data_maybe_string(rows)
     elif isinstance(obj, list):
         rows = obj
     else:
         raise ValueError(f"Unexpected kline payload type: {type(obj)}")
 
+    if isinstance(rows, dict):
+        # zeer zeldzaam, maar maak lijst van single dict
+        rows = [rows]
+
     if not isinstance(rows, list):
         raise ValueError(f"Klines not list, got {type(rows)}")
 
+    # controle: elk item moet indexeerbaar zijn
+    if len(rows) == 0:
+        return []
+
+    if not isinstance(rows[0], (list, tuple)):
+        # Soms komt er nog 1 niveau string omheen
+        rows = parse_data_maybe_string(rows)
+        if not isinstance(rows, list) or (rows and not isinstance(rows[0], (list, tuple))):
+            raise ValueError("Unexpected kline row structure")
+
     return rows
 
-
-def parse_kline_row(row: Any) -> Tuple[int, float, float, float, float, float]:
+# ---------------------------------------------------------
+# Kline ophalen (1m, 15m)
+# ---------------------------------------------------------
+def fetch_klines_for_symbol(symbol: str) -> Dict[str, Tuple[List[list], str]]:
     """
-    Zet 1 row om naar (ts_ms, open, high, low, close, volume)
-
-    Ondersteunt:
-      - dict met keys: time/ts/T, o/open, h/high, l/low, c/close, v/volume/amount/turnover
-      - list: [time, open, high, low, close, volume, ...] (indices 0..5)
+    Haal 1m en 15m op. Return dict:
+    { '1m': (rows, used_url), '15m': (rows, used_url) }
+    Gooit RuntimeError als beide endpoints falen voor een TF.
     """
-    def to_f(x):
-        if x is None:
-            return 0.0
-        if isinstance(x, (int, float)):
-            return float(x)
-        return float(str(x))
+    base = "https://contract.mexc.com/api/v1/contract/kline/{sym}?interval={interval}&limit={limit}"
+    endpoints = {
+        "1m": base.format(sym=symbol, interval="Min1", limit=KLINES_LIMIT_1M),
+        "15m": base.format(sym=symbol, interval="Min15", limit=KLINES_LIMIT_15M),
+    }
 
-    def to_i(x):
-        if x is None:
-            return 0
-        if isinstance(x, int):
-            return x
-        return int(float(str(x)))
+    out: Dict[str, Tuple[List[list], str]] = {}
 
-    if isinstance(row, dict):
-        # normaliseer keys lower
-        lower = {str(k).lower(): v for k, v in row.items()}
-        # tijd
-        ts = lower.get("time", lower.get("t", lower.get("ts", lower.get("timestamp"))))
-        ts = to_i(ts)
-        # MEXC geeft ms; als het seconden zijn, opschalen
-        if ts < 10_000_000_000:  # ~ 2001 in sec, dus te laag → ms nodig
-            ts *= 1000
+    for tf, url in endpoints.items():
+        last_err = None
+        used = None
+        for attempt in range(2):  # simpele retry
+            try:
+                payload = http_get(url)
+                rows = normalize_klines(payload)
+                used = url
+                out[tf] = (rows, used)
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(0.7)
+        if tf not in out:
+            raise RuntimeError(f"All MEXC kline endpoints failed for {symbol}. Last: {url} => {last_err}")
 
-        # ohlc
-        o = lower.get("open", lower.get("o"))
-        h = lower.get("high", lower.get("h"))
-        l = lower.get("low",  lower.get("l"))
-        c = lower.get("close", lower.get("c"))
+    return out
 
-        # volume: pak wat beschikbaar is
-        vol = (
-            lower.get("volume")
-            or lower.get("v")
-            or lower.get("amount")
-            or lower.get("turnover")
-            or lower.get("turnover24h")
-            or 0
-        )
-        return ts, to_f(o), to_f(h), to_f(l), to_f(c), to_f(vol)
+# ---------------------------------------------------------
+# Data extractie helpers
+# ---------------------------------------------------------
+def ts_to_iso_utc(ts_sec: float) -> str:
+    # MEXC timestamps lijken in seconden te komen
+    dt = datetime.fromtimestamp(float(ts_sec), tz=timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-    if isinstance(row, list):
-        # meest gangbaar: [t, o, h, l, c, v, ...]
-        if len(row) < 6:
-            raise ValueError(f"Unexpected short kline list: {row}")
-        ts = to_i(row[0])
-        if ts < 10_000_000_000:
-            ts *= 1000
-        o, h, l, c, v = to_f(row[1]), to_f(row[2]), to_f(row[3]), to_f(row[4]), to_f(row[5])
-        return ts, o, h, l, c, v
+def candle_from_rows(rows: List[list]) -> Dict[str, Any]:
+    """
+    Verwacht MEXC kline: [ts, open, high, low, close, volume]
+    """
+    if not rows:
+        return {}
+    last = rows[-1]
+    prev = rows[-2] if len(rows) > 1 else last
 
-    raise ValueError(f"Unsupported kline row type: {type(row)}")
+    try:
+        ts = float(last[0])
+        o = float(last[1]); h = float(last[2]); l = float(last[3]); c = float(last[4])
+        vol = float(last[5])
+        pclose = float(prev[4]) if prev is not last else c
+    except Exception as e:
+        raise ValueError(f"Unexpected row format: {last} ({e})")
 
+    return {
+        "time": ts_to_iso_utc(ts),
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "prev_close": pclose,
+        "volume": vol,
+    }
 
-# -------------------------
-# Business helpers
-# -------------------------
-def iso_utc(ts_ms: int) -> str:
-    return datetime.utcfromtimestamp(ts_ms / 1000.0).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def pct(a: float, b: float) -> float:
+def pct_change(a: float, b: float) -> float:
     if b == 0:
         return 0.0
     return (a - b) / b * 100.0
 
+# ---------------------------------------------------------
+# Snapshot bouwen
+# ---------------------------------------------------------
+def build_asset_block(human: str, mexc_symbol: str) -> Dict[str, Any]:
+    kl = fetch_klines_for_symbol(mexc_symbol)
 
-def fetch_klines_for_symbol(symbol_q: str) -> Tuple[List[Tuple[int, float, float, float, float, float]], str]:
-    """
-    Probeert de endpoints in KLINE_ENDPOINTS, retourneert:
-      - lijst met tuples (ts_ms, o, h, l, c, v)
-      - de effectieve bron-URL (debug)
-    """
-    last_err = None
-    for tpl in KLINE_ENDPOINTS:
-        url = tpl.format(sym=symbol_q, limit=KLINES_LIMIT)
-        try:
-            raw = http_get(url)
-            rows = normalize_klines(raw)
-            parsed = [parse_kline_row(r) for r in rows]
-            # sorteer op tijd
-            parsed.sort(key=lambda x: x[0])
-            return parsed, url
-        except Exception as e:
-            last_err = f"{url} -> {e}"
-            continue
-    raise RuntimeError(f"All MEXC kline endpoints failed for {symbol_q}. Last: {last_err}")
+    one = candle_from_rows(kl["1m"][0])
+    f15_rows = kl["15m"][0]
+    f15 = candle_from_rows(f15_rows)
 
+    # 15m %change t.o.v. vorige 15m close
+    change15 = pct_change(f15["close"], f15["prev_close"])
 
-def build_asset_block(symbol_name: str, symbol_mexc: str) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Bouwt de data voor één asset.
-    Returns:
-      - asset dict
-      - gebruikte bronnen (urls)
-    """
-    sources = []
-    klines, used_url = fetch_klines_for_symbol(symbol_mexc)
-    sources.append(used_url)
-
-    if not klines:
-        raise RuntimeError(f"No klines for {symbol_name}")
-
-    # laatste candle
-    ts, o, h, l, c, v = klines[-1]
-    prev_close = klines[-2][4] if len(klines) >= 2 else o
-    change_15m = None
-    # simpele 15m-change: vergelijk laatste close met close 15 candles terug indien beschikbaar
-    if len(klines) >= 16:
-        change_15m = pct(c, klines[-16][4])
-
-    asset = {
-        "pair": symbol_name,
-        "tf": "1m",
-        "price": c,
-        "prev_close": prev_close,
-        "change_1m_pct": pct(c, prev_close),
-        "change_15m_pct": change_15m,
-        "candle_time_utc": iso_utc(ts),
-        "volume_last": v,
-        # compacte 1m-ohlc voor de laatste N (tijd, o, h, l, c, v)
-        "klines_1m": [
-            [t, float(oo), float(hh), float(ll), float(cc), float(vv)]
-            for (t, oo, hh, ll, cc, vv) in klines[-KLINES_LIMIT:]
-        ],
+    return {
+        "pair": human,
+        "tf": {
+            "1m": {
+                "price": one["close"],
+                "prev": one["prev_close"],
+                "candle_time": one["time"],
+            },
+            "15m": {
+                "price": f15["close"],
+                "prev": f15["prev_close"],
+                "candle_time": f15["time"],
+                "volume": f15["volume"],
+                "change_pct": round(change15, 3),
+            },
+        },
+        "sources": {
+            "m1": kl["1m"][1],
+            "m15": kl["15m"][1],
+        },
     }
 
-    return asset, sources
+def build_snapshot() -> Dict[str, Any]:
+    assets = []
+    for mexc_symbol, human in SYMBOLS:
+        block = build_asset_block(human, mexc_symbol)
+        assets.append(block)
 
-
-def build_snapshot() -> Tuple[Dict[str, Any], List[str]]:
     now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-    snapshot_pairs = {}
-    used_sources = set()
-
-    for human, mexc in SYMBOLS.items():
-        block, srcs = build_asset_block(human, mexc)
-        snapshot_pairs[human] = block
-        for s in srcs:
-            used_sources.add(s)
-
-    snapshot = {
+    return {
         "updated_at": now_iso,
         "exchange": "mexc",
-        "kind": "perpetual",
-        "interval": "1m",
-        "pairs": snapshot_pairs,
-        "sources": sorted(used_sources),
-        "note": "OKX PERP replaced by MEXC PERP per user preference.",
+        "market": "perpetual",
+        "note": "prices from MEXC contract kline endpoints; times are UTC",
+        "data": assets,
     }
-    return snapshot, sorted(used_sources)
 
+# ---------------------------------------------------------
+# Output writers
+# ---------------------------------------------------------
+def ensure_outdir():
+    if not os.path.isdir(OUT_DIR):
+        os.makedirs(OUT_DIR, exist_ok=True)
 
-def write_json(path: str, obj: Any) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+def write_summary_json(obj: Dict[str, Any]):
+    ensure_outdir()
+    with open(SUMMARY_JSON, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-
-def write_snapshot_md(path: str, snap: Dict[str, Any]) -> None:
-    pairs = snap["pairs"]
+def write_snapshot_md(obj: Dict[str, Any]):
     lines = []
     lines.append("# Live Perp Snapshot (MEXC)")
     lines.append("")
-    lines.append(f"_Auto-updated_: **{snap['updated_at']}** (UTC)")
+    lines.append(f"_Auto-updated_: **{obj['updated_at']}** (UTC)")
     lines.append("")
-    lines.append("| Pair | TF | Price | % 1m | % 15m | Candle time (UTC) | Volume (last 1m) |")
-    lines.append("|:----:|:--:|------:|-----:|------:|:------------------:|-----------------:|")
+    lines.append("| Pair | TF | Price | Prev | Candle time (UTC) | Volume (15m) | Δ15m % |")
+    lines.append("|------|----|------:|-----:|-------------------|-------------:|------:|")
 
-    for k in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
-        a = pairs[k]
-        ch1 = f"{a['change_1m_pct']:.2f}%" if a["change_1m_pct"] is not None else "-"
-        ch15 = f"{a['change_15m_pct']:.2f}%" if a["change_15m_pct"] is not None else "-"
-        lines.append(
-            f"| {k} | {a['tf']} | {a['price']:.6f} | {ch1} | {ch15} | {a['candle_time_utc']} | {a['volume_last']:.4f} |"
-        )
+    for a in obj["data"]:
+        # 1m
+        lines.append(f"| {a['pair']} | 1m | {a['tf']['1m']['price']:,} | {a['tf']['1m']['prev']:,} | {a['tf']['1m']['candle_time']} |  |  |".replace(",", ""))
+        # 15m
+        vol = a["tf"]["15m"]["volume"]
+        chg = a["tf"]["15m"]["change_pct"]
+        lines.append(f"| {a['pair']} | 15m | {a['tf']['15m']['price']:,} | {a['tf']['15m']['prev']:,} | {a['tf']['15m']['candle_time']} | {vol:,} | {chg:+.3f}% |".replace(",", ""))
 
     lines.append("")
-    lines.append("**Bron:** MEXC perpetual klines (1m). Tijden in UTC.")
-    lines.append("")
-    lines.append("```json")
-    lines.append(json.dumps({"sources": snap.get("sources", [])}, ensure_ascii=False, indent=2))
-    lines.append("```")
+    lines.append("_Bron: MEXC perpetual klines (1m & 15m). Tijden in UTC._")
 
-    with open(path, "w", encoding="utf-8") as f:
+    with open(SNAPSHOT_MD, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-
-def main() -> None:
-    try:
-        snap, _src = build_snapshot()
-        write_json("data/summary.json", snap)
-        write_snapshot_md("SNAPSHOT.md", snap)
-        print("Snapshot built OK")
-    except Exception as e:
-        print(str(e))
-        traceback.print_exc()
-        sys.exit(1)
-
+# ---------------------------------------------------------
+# Main
+# ---------------------------------------------------------
+def main():
+    snap = build_snapshot()
+    write_summary_json(snap)
+    write_snapshot_md(snap)
+    # log voor GitHub Actions
+    print("Snapshot written:", SUMMARY_JSON, "and", SNAPSHOT_MD)
 
 if __name__ == "__main__":
     main()
