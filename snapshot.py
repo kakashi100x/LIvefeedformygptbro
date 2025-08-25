@@ -1,4 +1,6 @@
-Run python snapshot.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 Traceback (most recent call last):
   File "/home/runner/work/LIvefeedformygptbro/LIvefeedformygptbro/snapshot.py", line 218, in main
     snap = build_snapshot()
