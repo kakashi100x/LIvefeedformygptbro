@@ -2,40 +2,40 @@
   "exchange": "MEXC Perpetuals",
   "granularity": "Min1",
   "limit": 60,
-  "updated_at": "2025-10-10T14:57:36Z",
+  "updated_at": "2025-10-10T15:26:01Z",
   "assets": [
     {
       "symbol": "BTC_USDT",
       "label": "BTC/USDT Perp",
-      "price": 121100.1,
-      "updated_ts": 1760108220,
-      "ema20": 121242.77002800825,
-      "ema50": 121356.12085408652,
+      "price": 119355.4,
+      "updated_ts": 1760109960,
+      "ema20": 119856.23268495736,
+      "ema50": 120381.24612689331,
       "bias_15m": "bearish",
-      "vol20_sum": 5066411.0,
+      "vol20_sum": 25623959.0,
       "source": "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min1&limit=60"
     },
     {
       "symbol": "ETH_USDT",
       "label": "ETH/USDT Perp",
-      "price": 4319.61,
-      "updated_ts": 1760108220,
-      "ema20": 4326.299577441423,
-      "ema50": 4334.2785907021025,
+      "price": 4179.69,
+      "updated_ts": 1760109960,
+      "ema20": 4222.331074525194,
+      "ema50": 4263.839630647696,
       "bias_15m": "bearish",
-      "vol20_sum": 833221.0,
+      "vol20_sum": 7781764.0,
       "source": "https://contract.mexc.com/api/v1/contract/kline/ETH_USDT?interval=Min1&limit=60"
     },
     {
       "symbol": "SOL_USDT",
       "label": "SOL/USDT Perp",
-      "price": 222.16,
-      "updated_ts": 1760108220,
-      "ema20": 222.5701151864407,
-      "ema50": 222.82858977437834,
+      "price": 213.34,
+      "updated_ts": 1760109960,
+      "ema20": 215.97147156931598,
+      "ema50": 218.59697012832126,
       "bias_15m": "bearish",
-      "vol20_sum": 1149200.0,
-      "source": "https://contract.mexc.com/api/v1/contract/kline/SOL_USDT?interval=Min1&limit=60"
+      "vol20_sum": 5011053.0,
+      "source": "https://contract.mexc.com/api/v1/contract/kline/SOL_USDT?interval=Min1&limit=60&page_size=60"
     }
   ]
 }
