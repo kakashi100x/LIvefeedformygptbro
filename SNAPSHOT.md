@@ -1,22 +1,22 @@
-# Snapshot — 2025-12-17T08:49:19Z
+# Snapshot — 2025-12-17T09:17:31Z
 
 ## BTC/USDT Perp (BTC_USDT)
-- **Price:** 86395.1
-- **Bias 15m:** bearish
-- **EMA20/EMA50:** 86439.74377946086/86584.97475853485
-- **Vol(20):** 13712380.0
+- **Price:** 86513.8
+- **Bias 15m:** bullish
+- **EMA20/EMA50:** 86432.2654706453/86431.96146262772
+- **Vol(20):** 11274153.0
 - **Data source:** https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min1&limit=60
 
 ## ETH/USDT Perp (ETH_USDT)
-- **Price:** 2924.19
-- **Bias 15m:** bearish
-- **EMA20/EMA50:** 2925.527603101574/2931.6503959307893
-- **Vol(20):** 805029.0
+- **Price:** 2928.42
+- **Bias 15m:** bullish
+- **EMA20/EMA50:** 2925.640630575178/2925.645779368051
+- **Vol(20):** 869668.0
 - **Data source:** https://contract.mexc.com/api/v1/contract/kline/ETH_USDT?interval=Min1&limit=60
 
 ## SOL/USDT Perp (SOL_USDT)
-- **Price:** 126.9
-- **Bias 15m:** bearish
-- **EMA20/EMA50:** 126.99336502873115/127.30581326607663
-- **Vol(20):** 2102385.0
+- **Price:** 126.89
+- **Bias 15m:** bullish
+- **EMA20/EMA50:** 126.78866937987843/126.88667607699446
+- **Vol(20):** 2230464.0
 - **Data source:** https://contract.mexc.com/api/v1/contract/kline/SOL_USDT?interval=Min1&limit=60
